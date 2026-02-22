@@ -714,6 +714,8 @@ class EngineState:
     last_crypto_protect_ts: Dict[str, float] = field(default_factory=dict)  # per-symbol ts for last crypto protective-stop activity
     last_existing_stop_ts: Dict[str, float] = field(default_factory=dict)  # nsym -> ts when existing STOP observed
     last_existing_stop_log_ts: Dict[str, float] = field(default_factory=dict)  # throttle INFO logs
+    last_recovery_stop_action_ts: Dict[str, float] = field(default_factory=dict)  # throttle recovery stop place/cancel churn
+    last_recovery_stop_snapshot: Dict[str, str] = field(default_factory=dict)  # symbol -> compact existing stop signature
 
 # Launch-safe defaults
 #
@@ -2834,10 +2836,13 @@ class Engine(threading.Thread):
             self.trades.clear()
         except Exception:
             self.trades = {}
+        # legacy map may not exist in this build; clear only if present
         try:
-            self._symbol_to_trade.clear()
+            m = getattr(self, "_symbol_to_trade", None)
+            if isinstance(m, dict):
+                m.clear()
         except Exception:
-            self._symbol_to_trade = {}
+            pass
         try:
             self._oid_to_leg.clear()
         except Exception:
@@ -2848,16 +2853,37 @@ class Engine(threading.Thread):
             pass
 
 
+    def _find_active_trade_id_for_symbol(self, sym: str) -> Optional[str]:
+        """Return active trade_id for symbol from self.trades (legacy _symbol_to_trade is optional)."""
+        ns = normalize_symbol(sym)
+        for tid, t in list((getattr(self, "trades", {}) or {}).items()):
+            try:
+                if normalize_symbol(getattr(t, "symbol", "")) != ns:
+                    continue
+                st = str(getattr(t, "state", "") or "").upper()
+                if st in ("CLOSED", "CANCELED", "REJECTED", "DONE"):
+                    continue
+                return tid
+            except Exception:
+                continue
+        return None
+
+
 
     def _clear_trade_for_symbol(self, sym: str, note: str = "") -> None:
         """Clear ONLY the local trade state for a single symbol.
         Used for dust/edge cases so we don't get stuck in SYMBOL BUSY."""
         try:
             ns = normalize_symbol(sym)
-            tid = self._symbol_to_trade.get(ns)
+            tid = self._find_active_trade_id_for_symbol(ns)
             if tid and tid in self.trades:
                 self.trades.pop(tid, None)
-            self._symbol_to_trade.pop(ns, None)
+            try:
+                m = getattr(self, "_symbol_to_trade", None)
+                if isinstance(m, dict):
+                    m.pop(ns, None)
+            except Exception:
+                pass
             try:
                 self.state.last_existing_stop_ts.pop(ns, None)
                 self.state.last_existing_stop_log_ts.pop(ns, None)
@@ -2898,6 +2924,32 @@ class Engine(threading.Thread):
         except Exception:
             # never fail loudly here
             return
+
+    def _close_position_with_unreserve(self, symbol: str, qty: Optional[float] = None, reason: str = ""):
+        """Close position with crypto-safe unreserve retries."""
+        if not is_crypto_symbol(symbol):
+            return self.client.close_position(symbol) if qty is None else self.client.close_position(symbol, qty=qty)
+
+        last_err = None
+        for attempt in range(3):
+            try:
+                self._cancel_open_orders_for_symbol(symbol, cancel_stops=False, reason=(reason or 'close_pre') + f"_ns_{attempt}")
+            except Exception:
+                pass
+            try:
+                return self.client.close_position(symbol) if qty is None else self.client.close_position(symbol, qty=qty)
+            except Exception as e:
+                last_err = e
+                if not is_insufficient_balance_err(e):
+                    raise
+                try:
+                    self._cancel_open_orders_for_symbol(symbol, cancel_stops=True, reason=(reason or 'close_retry') + f"_all_{attempt}")
+                except Exception:
+                    pass
+                time.sleep(0.35)
+        if last_err is not None:
+            raise last_err
+        return None
 
     def _hb_loop(self):
         """Heartbeat loop runs independently so slow API calls don't trigger false watchdog restarts."""
@@ -3566,6 +3618,12 @@ class Engine(threading.Thread):
                     if t.stop_px:
                         stop_by_symbol[sym] = t.stop_px
                     self._oid_to_leg[t.stop_order_id] = (tid, "stop")
+                    try:
+                        snap = f"{str(o.get('id') or '')}|{otype}|{oside}|{float(o.get('qty') or 0.0):.8f}|{float(t.stop_px or 0.0):.8f}"
+                        self.state.last_recovery_stop_snapshot[sym] = snap
+                        self.state.last_recovery_stop_action_ts[sym] = now
+                    except Exception:
+                        pass
                     adopted = True
                     break
 
@@ -3604,6 +3662,15 @@ class Engine(threading.Thread):
             if guard_until and now < guard_until:
                 # Let the normal entry/stop lifecycle finish; recovery will revisit next cycle if needed
                 continue
+
+            # Per-symbol throttle: avoid cancel/replace STOP churn if no material change occurred.
+            try:
+                last_act = float(self.state.last_recovery_stop_action_ts.get(sym, 0.0) or 0.0)
+            except Exception:
+                last_act = 0.0
+            if last_act and (now - last_act) < 45.0:
+                continue
+
             self._cancel_open_orders_for_symbol(sym, reason='recovery_before_stop', cancel_stops=False)
             try:
                 qty_abs = abs(float(p.get("qty") or 0.0))
@@ -3653,12 +3720,18 @@ class Engine(threading.Thread):
                     stop_by_symbol[sym] = stop_px
                     self._oid_to_leg[oid] = (tid, "stop")
                     try:
-                        if is_crypto:
+                        if is_crypto_symbol(sym):
                             self.state.last_crypto_protect_ts[sym] = time.time()
+                        self.state.last_recovery_stop_action_ts[sym] = now
+                        self.state.last_recovery_stop_snapshot[sym] = f"{oid}|placed|{exit_side}|{float(stop_qty or 0.0):.8f}|{float(stop_px or 0.0):.8f}"
                     except Exception:
                         pass
                     self.out_q.put(("WARN", f"RECOVERY: placed protective STOP for {sym}: STOP {self.client._fmt_price_str(sym, stop_px)} ({stop_qty})"))
             except Exception as se:
+                try:
+                    self.state.last_recovery_stop_action_ts[sym] = now
+                except Exception:
+                    pass
                 # If we cannot place a protective stop, flatten immediately (safety first).
                 try:
                     qty_abs = abs(float(p.get("qty") or 0.0))
@@ -3684,7 +3757,7 @@ class Engine(threading.Thread):
                             if is_crypto_symbol(sym):
                                 # Crypto: cancel any resting orders that reserve qty, then close full position (no qty).
                                 self._cancel_open_orders_for_symbol(sym, reason="recovery_flatten_crypto")
-                                self.client.close_position(sym)
+                                self._close_position_with_unreserve(sym, reason='retry_close')
                             else:
                                 self.client.submit_order_market(sym, exit_side, qty_to_close, "gtc")
                         except Exception as e2:
@@ -3754,9 +3827,11 @@ class Engine(threading.Thread):
                 except Exception:
                     pass
             try:
-                for sym, tid in list((self._symbol_to_trade or {}).items()):
-                    if tid not in (self.trades or {}):
-                        self._symbol_to_trade.pop(sym, None)
+                m = getattr(self, '_symbol_to_trade', None)
+                if isinstance(m, dict):
+                    for sym, tid in list(m.items()):
+                        if tid not in (self.trades or {}):
+                            m.pop(sym, None)
             except Exception:
                 pass
             try:
@@ -4788,9 +4863,9 @@ class Engine(threading.Thread):
                                                 self._cancel_open_orders_for_symbol(t.symbol, reason="flatten_after_exit", cancel_stops=True)
                                             except Exception:
                                                 pass
-                                            resp = self.client.close_position(t.symbol, qty=None)
+                                            resp = self._close_position_with_unreserve(t.symbol, qty=None, reason='flatten_after_exit')
                                         else:
-                                            resp = self.client.close_position(t.symbol, qty=qty_close)
+                                            resp = self._close_position_with_unreserve(t.symbol, qty=qty_close, reason='flatten_after_exit')
                                     except Exception as _e1:
                                         av = parse_available_qty(str(_e1))
                                         if av is not None and is_crypto_symbol(t.symbol):
@@ -4800,12 +4875,12 @@ class Engine(threading.Thread):
                                             except Exception:
                                                 pass
                                             try:
-                                                resp = self.client.close_position(t.symbol, qty=None)
+                                                resp = self._close_position_with_unreserve(t.symbol, qty=None, reason='flatten_after_exit')
                                             except Exception:
                                                 safe = floor_crypto_qty(av)
                                                 if safe > 0:
                                                     qty_close = safe
-                                                    resp = self.client.close_position(t.symbol, qty=qty_close)
+                                                    resp = self._close_position_with_unreserve(t.symbol, qty=qty_close, reason='flatten_after_exit')
                                                 else:
                                                     raise
                                         else:
@@ -4837,11 +4912,12 @@ class Engine(threading.Thread):
                                                 raise
 
                                     if oid_flat:
+                                        qty_for_log = float(_rem) if is_crypto_symbol(t.symbol) else float(qty_close)
                                         t.flatten_order_id = oid_flat
-                                        self._open_orders[oid_flat] = {'trade_id': t.trade_id, 'leg':'flatten', 'symbol':t.symbol, 'side': ('sell' if t.side == 'buy' else 'buy'), 'qty': float(qty_close), 'ts': now, 'why': feed_why_for_trade(t), 'news': t.news}
+                                        self._open_orders[oid_flat] = {'trade_id': t.trade_id, 'leg':'flatten', 'symbol':t.symbol, 'side': ('sell' if t.side == 'buy' else 'buy'), 'qty': float(qty_for_log), 'ts': now, 'why': feed_why_for_trade(t), 'news': t.news}
                                         t.state = 'FLATTEN_WORKING'
                                         write_trade_event(trade_id=t.trade_id, event="FLATTEN_SUBMITTED", symbol=t.symbol, side=t.side, qty=float(qty_for_log), price=float(_expx), state=t.state, why=t.why, news=t.news, meta={"after_leg": leg})
-                                        self.out_q.put(('WARN', f"FLATTEN: closing remaining {t.symbol} qty={qty_close} after {leg} fill"))
+                                        self.out_q.put(('WARN', f"FLATTEN: closing remaining {t.symbol} qty={qty_for_log} after {leg} fill"))
                                     else:
                                         raise RuntimeError('close_position/market returned no order id')
                                 else:
@@ -5138,7 +5214,7 @@ class Engine(threading.Thread):
                         self._cancel_open_orders_for_symbol(sym, cancel_stops=True, reason='retry_close')
                     except Exception:
                         pass
-                    self.client.close_position(sym)
+                    self._close_position_with_unreserve(sym, reason='retry_close')
                 except Exception as e:
                     # Keep window alive only for the transient insufficient balance case
                     if not is_insufficient_balance_err(e):
@@ -5197,7 +5273,7 @@ class Engine(threading.Thread):
                     else:
                         qty_close = int(max(0, round(qty_close)))
                     if (qty_close is None) or (qty_close and float(qty_close) > 0):
-                        resp = self.client.close_position(t.symbol) if qty_close is None else self.client.close_position(t.symbol, qty=qty_close)
+                        resp = self._close_position_with_unreserve(t.symbol, qty=qty_close, reason='time_stop_flatten')
                         oid_flat = ""
                         try:
                             oid_flat = str((resp or {}).get("id") or (resp or {}).get("order_id") or "")
