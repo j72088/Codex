@@ -37,3 +37,7 @@ Click rule (always)
 
 RUN_APP.bat now auto-installs Python dependencies into a local .venv on first run.
 If it fails, open run_app.log in the project folder.
+
+
+Update packaging
+- After any code update, run `REZIP_PROJECT.bat` from the project folder to create a fresh downloadable zip archive with the current `.py/.bat/.txt` files and `requirements.txt`.
